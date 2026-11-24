@@ -9,9 +9,10 @@
     <button type="submit">查看</button>
     {% if report %}
       <a class="button secondary" href="{{ url_for('day_csv', date=raw_day) }}">下载当天 CSV</a>
+      <a class="button secondary" href="{{ url_for('leap_view', review_date=raw_day) }}">换表并对比这一天</a>
     {% endif %}
   </form>
-  <p class="hint">区间按左闭右开计算；正闰秒日共 86401 秒，最后一秒为 23:59:60。</p>
+  <p class="hint">区间按左闭右开计算；正闰秒日共 86401 秒，最后一秒为 23:59:60。取数始终使用同一已提交的闰秒表快照与曝光数据。</p>
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
 </section>
 
@@ -52,7 +53,9 @@
         <tr>
           <td>{{ row.telescope }}</td>
           <td>{{ row.exposure_id }}</td>
-          <td><code>{{ row.source_start }}</code></td>
+          <td><code>{{ row.source_start }}</code>
+            <span class="src-tag {{ 'src-utc' if row.start_source == 'utc' else 'src-real' }}">{{ 'UTC文本' if row.start_source == 'utc' else '实秒' }}</span>
+          </td>
           <td class="num">{{ row.source_duration_s }}</td>
           <td><code>{{ row.window_start_utc }}</code></td>
           <td><code>{{ row.window_end_utc }}</code></td>

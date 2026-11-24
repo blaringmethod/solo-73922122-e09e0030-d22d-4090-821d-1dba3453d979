@@ -8,20 +8,34 @@ the exact header names from the uploaded file) and its raw start token
 ``23:59:60`` - or an integer count of real seconds since
 2000-01-01 00:00:00 UTC.
 
-``start_real`` is the canonical instant used for range queries.  Text rows
-derive it with the leap table active at import; real-second rows use the
-submitted integer directly.  Both are re-derived or re-tagged when the leap
-table changes.
+Two table-independent coordinates make leap-table replacements cheap:
+
+* ``start_real`` is the absolute instant for rows submitted as real seconds
+  and stays untouched for every row after import.  Real-second day windows use
+  the existing ``exposures_start_real_id`` index.
+* ``utc_day`` / ``utc_sod`` / ``utc_key`` encode the literal UTC label (every
+  civil day gets an 86401-slot block, so ``23:59:60`` is slot 86400).  They do
+  NOT depend on the leap table and are never rewritten by a swap.  UTC-text
+  day windows use the partial ``exposures_utc_key`` index; the partial
+  covering index ``exposures_utc_leap60`` answers swap validation.
+
+At read time a UTC-text row is reinterpreted from its preserved ``start_raw``
+under the single leap-table version loaded for the fetch ("preserve the UTC
+moment"), while a real-second row keeps using its frozen ``start_real``
+("preserve the absolute instant").
 
 Leap tables are immutable, versioned rows.  Replacement validates the whole
-candidate table with the whole stored set in one transaction.  If any stored
-UTC text would become invalid, the swap is rejected, the offending exposure
-ids are returned, and the old table stays active.
+candidate table in one transaction.  The only stored starts that can become
+invalid are ``23:59:60`` UTC starts on a leap day the candidate deletes; those
+are found solely through the leap-60 index.  On conflict the swap is rejected,
+the offending exposure ids are returned and the previous table stays active.
+A successful swap inserts one new ``leap_tables`` row and never updates,
+deletes or reindexes ``exposures``.
 
 Writers serialise with an in-process lock and ``BEGIN IMMEDIATE``.  Readers
 use a WAL snapshot and load exactly one leap-table version per request, so a
-day fetch always uses one consistent table even while a replacement or import
-is running.
+day fetch always uses one consistent committed state even while a replacement
+or import is running.
 """
 
 from __future__ import annotations
@@ -39,14 +53,18 @@ from pathlib import Path
 from .timecode import (
     DEFAULT_LEAP_TABLE,
     EPOCH,
+    EPOCH_DATE,
     LeapTable,
     TimecodeError,
     day_range_real,
+    day_utc_key_window,
     fmt_utc,
     format_leap_table,
+    normalize_utc_text,
     parse_leap_table,
     parse_utc,
     real_to_utc,
+    utc_parts_from_text,
     utc_to_real,
 )
 
@@ -120,7 +138,10 @@ def _connect(path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-SCHEMA = """
+# Fresh databases get the stable UTC-key columns directly.  Legacy databases
+# (created by the previous all-rewrite implementation) have the same tables
+# without those columns; ``_migrate_schema`` adds them in place.
+SCHEMA_TABLES = """
 CREATE TABLE IF NOT EXISTS leap_tables (
     version    INTEGER PRIMARY KEY,
     body       TEXT NOT NULL,
@@ -145,13 +166,33 @@ CREATE TABLE IF NOT EXISTS exposures (
     duration_s   INTEGER NOT NULL CHECK (duration_s BETWEEN 1 AND 3600),
     raw_json     TEXT NOT NULL,
     leap_version INTEGER NOT NULL REFERENCES leap_tables(version),
-    batch_id     INTEGER NOT NULL REFERENCES import_batches(id)
+    batch_id     INTEGER NOT NULL REFERENCES import_batches(id),
+    utc_day      INTEGER,
+    utc_sod      INTEGER,
+    utc_key      INTEGER
 );
+"""
 
+# Baseline indexes are preserved exactly.  The two partial UTC indexes are
+# what make text-row day windows and leap-60 conflict checks index-only /
+# index-range operations.
+SCHEMA_INDEXES = """
 CREATE INDEX IF NOT EXISTS exposures_start_real ON exposures(start_real);
 CREATE INDEX IF NOT EXISTS exposures_start_real_id ON exposures(start_real, exposure_id);
 CREATE INDEX IF NOT EXISTS exposures_batch ON exposures(batch_id);
+CREATE INDEX IF NOT EXISTS exposures_utc_key
+    ON exposures(utc_key, exposure_id)
+    WHERE start_source = 'utc';
+CREATE INDEX IF NOT EXISTS exposures_utc_leap60
+    ON exposures(utc_sod, utc_day, exposure_id, start_source);
 """
+
+#: Full idempotent schema for a fresh database.
+SCHEMA = SCHEMA_TABLES + SCHEMA_INDEXES
+
+_EXPOSURE_COLUMNS = (
+    "exposure_id, telescope, start_source, start_raw, start_real, duration_s"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +305,9 @@ def _validate_row(row: dict, table: LeapTable) -> list[str]:
 
     start_real: int | None = None
     start_source: str | None = None
+    utc_day: int | None = None
+    utc_sod: int | None = None
+    utc_key: int | None = None
     if not start_text:
         errors.append(f"line {line}: start is required")
     elif INTEGER_RE.match(start_text):
@@ -305,6 +349,8 @@ def _validate_row(row: dict, table: LeapTable) -> list[str]:
                 )
             else:
                 start_source = "utc"
+                # Table-independent label key; kept stable across swaps.
+                utc_day, utc_sod, utc_key = utc_parts_from_text(start_text)
 
     duration: int | None = None
     if not duration_text:
@@ -336,6 +382,9 @@ def _validate_row(row: dict, table: LeapTable) -> list[str]:
             "start_source": start_source,
             "start_raw": start_text,
             "start_real": start_real,
+            "utc_day": utc_day,
+            "utc_sod": utc_sod,
+            "utc_key": utc_key,
             "duration_s": duration,
             "raw_json": json.dumps(
                 row["raw_original"], ensure_ascii=False, sort_keys=True
@@ -360,7 +409,7 @@ class Ledger:
         with self._write_lock:
             conn = _connect(self.path)
             try:
-                conn.executescript(SCHEMA)
+                conn.executescript(SCHEMA_TABLES)
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     count = conn.execute("SELECT COUNT(*) FROM leap_tables").fetchone()[
@@ -378,8 +427,83 @@ class Ledger:
                     if conn.in_transaction:
                         conn.execute("ROLLBACK")
                     raise
+
+                # In-place upgrade of legacy databases, then idempotent indexes.
+                self._migrate_columns(conn)
+                _version, table = self._active_table_tx(conn)
+                self._backfill_utc_keys(conn, table)
+                conn.executescript(SCHEMA_INDEXES)
             finally:
                 conn.close()
+
+    # -- schema migration --------------------------------------------------
+
+    @staticmethod
+    def _migrate_columns(conn: sqlite3.Connection) -> list[str]:
+        """Add stable UTC-key columns to an old database (in place)."""
+
+        existing = {
+            row["name"] for row in conn.execute("PRAGMA table_info(exposures)")
+        }
+        added: list[str] = []
+        for name, declaration in (
+            ("utc_day", "INTEGER"),
+            ("utc_sod", "INTEGER"),
+            ("utc_key", "INTEGER"),
+        ):
+            if name not in existing:
+                conn.execute(
+                    f"ALTER TABLE exposures ADD COLUMN {name} {declaration}"
+                )
+                added.append(name)
+        return added
+
+    @staticmethod
+    def _backfill_utc_keys(conn: sqlite3.Connection, table: LeapTable) -> int:
+        """Fill stable UTC keys for pre-existing text rows once.
+
+        Raw text is enough on its own.  As a defensive fallback for a token
+        that no longer normalises, derive the label from the frozen
+        ``start_real`` under the active table.
+        """
+
+        rows = conn.execute(
+            "SELECT exposure_id, start_raw, start_real FROM exposures "
+            "WHERE start_source = 'utc' AND utc_key IS NULL"
+        ).fetchall()
+        if not rows:
+            return 0
+        updates: list[tuple[int, int, int, str]] = []
+        for row in rows:
+            try:
+                utc_day, utc_sod, utc_key = utc_parts_from_text(row["start_raw"])
+            except TimecodeError:
+                real = int(row["start_real"])
+                dt_value, on_leap = real_to_utc(real, table)
+                day = dt_value.date()
+                second_of_day = (
+                    dt_value.hour * 3600
+                    + dt_value.minute * 60
+                    + dt_value.second
+                    + (1 if on_leap else 0)
+                )
+                ordinal = (day - EPOCH_DATE).days
+                utc_day, utc_sod = ordinal, second_of_day
+                utc_key = ordinal * 86401 + second_of_day
+            updates.append((utc_day, utc_sod, utc_key, row["exposure_id"]))
+        conn.execute("BEGIN")
+        try:
+            conn.executemany(
+                "UPDATE exposures SET utc_day = ?, utc_sod = ?, utc_key = ? "
+                "WHERE exposure_id = ?",
+                updates,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return len(updates)
 
     # -- read side ---------------------------------------------------------
 
@@ -427,9 +551,18 @@ class Ledger:
         """Fetch exposures intersecting one UTC civil day.
 
         One read transaction supplies both the leap table and the rows, so the
-        day boundaries, SQL filter, clipping and formatting all use the same
-        table version even if a replacement commits concurrently.  Only rows
-        whose start lies within ``[day_start - 3600, day_end)`` are read.
+        day boundaries, index windows, clipping and formatting all use the
+        same committed table/exposure snapshot even if a replacement or import
+        commits concurrently.
+
+        Two index range reads supply candidates:
+
+        * UTC-text rows via the table-independent ``utc_key`` label window;
+        * real-second rows via ``start_real`` in
+          ``[day_start - 3600, day_end)``.
+
+        Exact intersection and half-open clipping are then computed under the
+        active table from each row's preserved coordinate.
         """
 
         if not isinstance(day, _dt.date):
@@ -449,15 +582,33 @@ class Ledger:
             conn.execute("BEGIN")
             version, table = self._active_table_tx(conn)
             start_real, end_real = day_range_real(day, table)
-            cursor = conn.execute(
-                "SELECT exposure_id, telescope, start_source, start_raw, start_real, duration_s "
-                "FROM exposures "
-                "WHERE start_real >= ? AND start_real < ? "
-                "AND start_real + duration_s > ? "
-                "ORDER BY start_real, exposure_id",
-                (start_real - MAX_DURATION, end_real, start_real),
+            key_low, key_high = day_utc_key_window(day)
+
+            utc_candidates = conn.execute(
+                f"SELECT {_EXPOSURE_COLUMNS} FROM exposures "
+                "INDEXED BY exposures_utc_key "
+                "WHERE start_source = 'utc' AND utc_key >= ? AND utc_key < ?",
+                (key_low, key_high),
+            ).fetchall()
+            real_candidates = conn.execute(
+                f"SELECT {_EXPOSURE_COLUMNS} FROM exposures "
+                "INDEXED BY exposures_start_real_id "
+                "WHERE start_source = 'real' "
+                "AND start_real >= ? AND start_real < ?",
+                (start_real - MAX_DURATION, end_real),
+            ).fetchall()
+
+            rows: list[dict] = []
+            for row in (*utc_candidates, *real_candidates):
+                clipped = _clip_row(row, start_real, end_real, table)
+                if clipped is not None:
+                    rows.append(clipped)
+            rows.sort(
+                key=lambda item: (
+                    item["effective_start_real"],
+                    item["exposure_id"],
+                )
             )
-            rows = [_clip_row(row, start_real, end_real, table) for row in cursor]
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:
@@ -502,7 +653,8 @@ class Ledger:
         """Validate and insert one CSV batch under the active leap table.
 
         The batch is all-or-nothing.  Duplicate ids inside the batch and ids
-        already stored reject the whole batch.
+        already stored reject the whole batch.  Validation happens inside
+        ``BEGIN IMMEDIATE`` against the table committed at submit time.
         """
 
         batch = parse_csv(text)
@@ -542,8 +694,9 @@ class Ledger:
                 try:
                     conn.executemany(
                         "INSERT INTO exposures(exposure_id, telescope, start_source, start_raw, "
-                        "start_real, duration_s, raw_json, leap_version, batch_id) "
-                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "start_real, duration_s, raw_json, leap_version, batch_id, "
+                        "utc_day, utc_sod, utc_key) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         [
                             (
                                 row["exposure_id"],
@@ -555,6 +708,9 @@ class Ledger:
                                 row["raw_json"],
                                 version,
                                 batch_id,
+                                row["utc_day"],
+                                row["utc_sod"],
+                                row["utc_key"],
                             )
                             for row in batch.rows
                         ],
@@ -585,14 +741,112 @@ class Ledger:
             finally:
                 conn.close()
 
+    # -- leap-table replacement -------------------------------------------
+
+    @staticmethod
+    def _deleted_days(old_table: LeapTable, new_table: LeapTable) -> list[_dt.date]:
+        return sorted(set(old_table.dates) - set(new_table.dates))
+
+    def _leap60_conflicts_tx(
+        self,
+        conn: sqlite3.Connection,
+        deleted_days: list[_dt.date],
+    ) -> list[dict]:
+        """Index-only lookup of stored ``23:59:60`` starts on deleted days.
+
+        The query is served by the partial covering index
+        ``exposures_utc_leap60`` (``utc_day, exposure_id`` for UTC rows whose
+        literal second-of-day is 86400); no full exposure scan or Python
+        re-validation of every stored timestamp is performed.  Display fields
+        are then fetched by primary key.
+        """
+
+        if not deleted_days:
+            return []
+        ordinals = [(day - EPOCH_DATE).days for day in deleted_days]
+        day_by_ordinal = {
+            (day - EPOCH_DATE).days: day.isoformat() for day in deleted_days
+        }
+        placeholders = ",".join("?" for _ in ordinals)
+        index_rows = conn.execute(
+            "SELECT exposure_id, utc_day FROM exposures "
+            "INDEXED BY exposures_utc_leap60 "
+            "WHERE start_source = 'utc' AND utc_sod = 86400 "
+            f"AND utc_day IN ({placeholders}) "
+            "ORDER BY exposure_id",
+            ordinals,
+        ).fetchall()
+        if not index_rows:
+            return []
+
+        ordinal_by_id = {
+            row["exposure_id"]: int(row["utc_day"]) for row in index_rows
+        }
+        ids = list(ordinal_by_id)
+        id_placeholders = ",".join("?" for _ in ids)
+        details = {
+            row["exposure_id"]: row
+            for row in conn.execute(
+                "SELECT exposure_id, telescope, start_raw FROM exposures "
+                f"WHERE exposure_id IN ({id_placeholders})",
+                ids,
+            )
+        }
+        offending: list[dict] = []
+        for exposure_id in ids:
+            detail = details.get(exposure_id)
+            day_text = day_by_ordinal.get(
+                ordinal_by_id[exposure_id], str(ordinal_by_id[exposure_id])
+            )
+            offending.append(
+                {
+                    "exposure_id": exposure_id,
+                    "telescope": detail["telescope"] if detail else "",
+                    "start": detail["start_raw"] if detail else f"{day_text} 23:59:60",
+                    "error": (
+                        f"{day_text} is removed from the new leap table, so "
+                        "23:59:60 no longer exists on that UTC day"
+                    ),
+                }
+            )
+        return offending
+
+    def preview_leap_table(self, text: str) -> dict:
+        """Parse a candidate table and report index-found conflicts.
+
+        Read-only; uses the same committed table and index lookup as
+        :meth:`replace_leap_table`.
+        """
+
+        new_table = parse_leap_table(text)
+        conn = _connect(self.path)
+        try:
+            conn.execute("BEGIN")
+            old_version, old_table = self._active_table_tx(conn)
+            deleted = self._deleted_days(old_table, new_table)
+            offending = self._leap60_conflicts_tx(conn, deleted)
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        return {
+            "version": old_version,
+            "table": new_table,
+            "deleted_days": deleted,
+            "offending": offending,
+        }
+
     def replace_leap_table(self, text: str) -> dict:
         """Validate and activate a complete positive-leap date table.
 
-        The candidate is applied to every stored text-sourced start time in one
-        transaction.  A single invalid stored time aborts the swap, reports the
-        offending exposure ids, and leaves the previous table in force.  Rows
-        submitted as absolute real seconds are never invalidated, but their
-        formatting uses the new table afterwards.
+        Validation only checks stored ``23:59:60`` UTC starts on days the
+        candidate deletes, through the leap-60 index.  A conflict aborts the
+        swap, reports the offending exposure ids and leaves the previous table
+        active.  Success inserts a new immutable ``leap_tables`` version only:
+        exposure rows and their time indexes are preserved exactly.
         """
 
         try:
@@ -607,34 +861,10 @@ class Ledger:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 old_version, old_table = self._active_table_tx(conn)
-
-                invalid: list[dict] = []
-                text_updates: list[tuple[int, int, str]] = []
-                for row in conn.execute(
-                    "SELECT exposure_id, telescope, start_raw FROM exposures "
-                    "WHERE start_source = 'utc' ORDER BY exposure_id"
-                ):
-                    try:
-                        parse_utc(row["start_raw"], new_table)
-                        real = utc_to_real(row["start_raw"], new_table)
-                        if real < 0:
-                            raise TimecodeError("stored time is before 2000-01-01")
-                        real_to_utc(real, new_table)  # ensure it is representable
-                    except (TimecodeError, OverflowError) as exc:
-                        invalid.append(
-                            {
-                                "exposure_id": row["exposure_id"],
-                                "telescope": row["telescope"],
-                                "start": row["start_raw"],
-                                "error": str(exc),
-                            }
-                        )
-                    else:
-                        text_updates.append((real, 0, row["exposure_id"]))
-                    if len(invalid) >= MAX_SWAP_REPORT:
-                        break
-                if invalid:
-                    raise LeapSwapRejected(invalid)
+                deleted_days = self._deleted_days(old_table, new_table)
+                offending = self._leap60_conflicts_tx(conn, deleted_days)
+                if offending:
+                    raise LeapSwapRejected(offending)
 
                 if new_table == old_table:
                     conn.execute("COMMIT")
@@ -642,7 +872,12 @@ class Ledger:
                         "version": old_version,
                         "previous_version": old_version,
                         "updated_text_rows": 0,
+                        "rewritten_rows": 0,
+                        "rows_rewritten": 0,
+                        "rewritten_exposures": 0,
                         "unchanged": True,
+                        "conflict_count": 0,
+                        "deleted_days": [d.isoformat() for d in deleted_days],
                         "leap_days": len(new_table.dates),
                     }
 
@@ -651,23 +886,19 @@ class Ledger:
                     "INSERT INTO leap_tables(version, body, created_at) VALUES(?, ?, ?)",
                     (new_version, format_leap_table(new_table), _iso_now()),
                 )
-                conn.executemany(
-                    "UPDATE exposures SET start_real = ?, leap_version = ? "
-                    "WHERE exposure_id = ?",
-                    [(real, new_version, eid) for real, _old, eid in text_updates],
-                )
-                # Real-second rows keep their absolute instant; their
-                # provenance moves to the active table for future fetches.
-                conn.execute(
-                    "UPDATE exposures SET leap_version = ? WHERE start_source = 'real'",
-                    (new_version,),
-                )
+                # Intentionally NO updates to exposures or its indexes.
                 conn.execute("COMMIT")
                 return {
                     "version": new_version,
                     "previous_version": old_version,
-                    "updated_text_rows": len(text_updates),
+                    # Kept as a key for older templates/callers; always zero now.
+                    "updated_text_rows": 0,
+                    "rewritten_rows": 0,
+                    "rows_rewritten": 0,
+                    "rewritten_exposures": 0,
                     "unchanged": False,
+                    "conflict_count": 0,
+                    "deleted_days": [d.isoformat() for d in deleted_days],
                     "leap_days": len(new_table.dates),
                 }
             except Exception:
@@ -678,13 +909,46 @@ class Ledger:
                 conn.close()
 
 
-def _clip_row(row: sqlite3.Row, day_start: int, day_end: int, table: LeapTable) -> dict:
-    real_start = int(row["start_real"])
-    real_end = real_start + int(row["duration_s"])
+def _clip_row(
+    row: sqlite3.Row,
+    day_start: int,
+    day_end: int,
+    table: LeapTable,
+) -> dict | None:
+    """Clip one candidate row to ``[day_start, day_end)``.
+
+    Returns ``None`` when the strict half-open intersection is empty.  The
+    effective absolute start is taken from the preserved UTC label under the
+    active table for UTC-text rows, and from frozen ``start_real`` for
+    real-second rows.
+    """
+
+    duration = int(row["duration_s"])
+    if row["start_source"] == "utc":
+        try:
+            real_start = utc_to_real(row["start_raw"], table)
+        except TimecodeError:
+            # The swap transaction guarantees this cannot happen to committed
+            # data; keep the fetch available if a legacy file breaks the rule.
+            real_start = int(row["start_real"])
+    else:
+        real_start = int(row["start_real"])
+
+    real_end = real_start + duration
+    # Half-open intersection: [start, end) and [day_start, day_end).
+    if real_start >= day_end or real_end <= day_start:
+        return None
+
     clip_start = max(real_start, day_start)
     clip_end = min(real_end, day_end)
 
-    source_dt, source_leap = real_to_utc(real_start, table)
+    if row["start_source"] == "utc":
+        # Preserved UTC moment: show the canonicalised original label rather
+        # than rendering the frozen import-time coordinate through a new table.
+        source_start_utc = normalize_utc_text(row["start_raw"])
+    else:
+        source_dt, source_leap = real_to_utc(real_start, table)
+        source_start_utc = fmt_utc(source_dt, source_leap)
     start_dt, start_leap = real_to_utc(clip_start, table)
     end_dt, end_leap = real_to_utc(clip_end, table)
     return {
@@ -692,8 +956,9 @@ def _clip_row(row: sqlite3.Row, day_start: int, day_end: int, table: LeapTable) 
         "telescope": row["telescope"],
         "start_source": row["start_source"],
         "source_start": row["start_raw"],
-        "source_start_utc": fmt_utc(source_dt, source_leap),
-        "source_duration_s": int(row["duration_s"]),
+        "source_start_utc": source_start_utc,
+        "source_duration_s": duration,
+        "effective_start_real": real_start,
         "window_start_utc": fmt_utc(start_dt, start_leap),
         "window_end_utc": fmt_utc(end_dt, end_leap),
         "window_start_real": clip_start,

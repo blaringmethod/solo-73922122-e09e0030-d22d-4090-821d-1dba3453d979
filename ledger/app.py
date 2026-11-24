@@ -179,8 +179,24 @@ def create_app(config: dict | None = None) -> Flask:
         offending: list[dict] | None = None
         result = None
         message = None
+        # A day page can hand its date here so the operator can swap the table
+        # and jump straight back to the same day's before/after detail.
+        review_date = (
+            request.values.get("review_date", "") or request.args.get("date", "")
+        ).strip()
+        try:
+            if review_date:
+                parse_date(review_date)
+        except TimecodeError:
+            review_date = ""
         if request.method == "POST":
             text = request.form.get("leap_text", "")
+            review_date = (request.form.get("review_date", "") or "").strip()
+            try:
+                if review_date:
+                    parse_date(review_date)
+            except TimecodeError:
+                review_date = ""
             try:
                 result = app.ledger.replace_leap_table(text)
             except LeapSwapRejected as exc:
@@ -202,6 +218,7 @@ def create_app(config: dict | None = None) -> Flask:
             offending=offending,
             result=result,
             message=message,
+            review_date=review_date,
             stats=app.ledger.stats(),
         )
 

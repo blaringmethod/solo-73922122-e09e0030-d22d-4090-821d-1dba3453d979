@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY ledger ./ledger
 COPY templates ./templates
 COPY static ./static
+COPY scripts ./scripts
 COPY wsgi.py ./
 
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin ledger \

@@ -21,6 +21,11 @@ from dataclasses import dataclass
 EPOCH = _dt.datetime(2000, 1, 1, 0, 0, 0)
 EPOCH_DATE = EPOCH.date()
 DAY = 86400
+#: Width of one civil-day block in :func:`utc_label_key`.  A positive leap
+#: second gives the block slots ``0..86400`` (23:59:60 is slot 86400); the
+#: next day starts at the following slot, so every UTC label - including
+#: ``23:59:60`` - has a unique, chronologically ordered, table-independent key.
+EXTENDED_DAY = DAY + 1
 UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -208,6 +213,79 @@ def day_range_real(day: _dt.date, table: LeapTable) -> tuple[int, int]:
 
     start = utc_to_real(f"{day.isoformat()} 00:00:00", table)
     return start, start + day_length(day, table)
+
+
+# ---------------------------------------------------------------------------
+# Table-independent UTC label keys
+# ---------------------------------------------------------------------------
+#
+# Unlike :func:`utc_to_real`, these coordinates do NOT depend on the active
+# leap table.  A UTC-text exposure therefore keeps the exact same key - and
+# the same index entry - across leap-table replacements, which is what lets a
+# swap leave exposure rows and time indexes untouched while the preserved UTC
+# label is reinterpreted under the new table at read time.
+
+
+def utc_day_ordinal(day: _dt.date) -> int:
+    """Integer day index used by the stable UTC key (epoch day = 0)."""
+
+    if not isinstance(day, _dt.date):
+        raise TimecodeError("day must be a date")
+    return (day - EPOCH_DATE).days
+
+
+def utc_label_parts(text: str) -> tuple[_dt.date, int]:
+    """Split accepted UTC text into ``(civil day, literal second of day)``.
+
+    The literal second may be 60 for ``23:59:60``, which yields second-of-day
+    86400.  No leap table is consulted, so the result is stable across swaps.
+    """
+
+    value = normalize_utc_text(text)
+    date_part, time_part = value.split(" ")
+    day = _dt.date.fromisoformat(date_part)
+    hour, minute, second = (int(part) for part in time_part.split(":"))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 60):
+        raise TimecodeError(f"invalid clock fields in {text!r}")
+    return day, hour * 3600 + minute * 60 + second
+
+
+def utc_label_key(text: str) -> int:
+    """Stable, chronologically ordered key for a UTC start token."""
+
+    day, second_of_day = utc_label_parts(text)
+    return utc_day_ordinal(day) * EXTENDED_DAY + second_of_day
+
+
+def utc_parts_from_text(text: str) -> tuple[int, int, int]:
+    """Return ``(utc_day, utc_sod, utc_key)`` for a UTC start token."""
+
+    day, second_of_day = utc_label_parts(text)
+    ordinal = utc_day_ordinal(day)
+    return ordinal, second_of_day, ordinal * EXTENDED_DAY + second_of_day
+
+
+def leap60_key(day: _dt.date) -> int:
+    """Stable key of ``day 23:59:60`` (second-of-day 86400)."""
+
+    return utc_day_ordinal(day) * EXTENDED_DAY + DAY
+
+
+def day_utc_key_window(day: _dt.date) -> tuple[int, int]:
+    """Stable-key window that may contain starts intersecting ``day``.
+
+    The lower bound is the previous day's ``23:00:00`` label (a start at most
+    3600 real seconds before the day boundary can intersect; positive leap
+    seconds can only make the real distance larger than the label distance, so
+    this bound never misses a row).  The exclusive upper bound is the next
+    day's ``00:00:00`` key, which includes ``23:59:60`` of ``day`` but excludes
+    the next midnight exactly.
+    """
+
+    ordinal = utc_day_ordinal(day)
+    lower = (ordinal - 1) * EXTENDED_DAY + 23 * 3600
+    upper = (ordinal + 1) * EXTENDED_DAY
+    return lower, upper
 
 
 def parse_leap_table(text: str) -> LeapTable:

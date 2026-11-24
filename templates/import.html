@@ -15,8 +15,16 @@
     <input type="file" id="csv_file" name="csv_file" accept=".csv,text/csv">
     <label for="csv_text">或粘贴 CSV 文本</label>
     <textarea id="csv_text" name="csv_text" rows="8" placeholder="telescope,exposure_id,start,duration_s&#10;T1,EXP001,2026-11-24 00:00:00,600"></textarea>
-    <button type="submit">整批校验并导入</button>
+    <div class="row">
+      <button type="submit">整批校验并导入</button>
+      <button type="button" class="button secondary" id="fill-demo">填入 2016 跨年夜演示数据</button>
+      <button type="button" class="button secondary" id="fill-leap60">追加一条 23:59:60 冲突演示</button>
+    </div>
   </form>
+  <p class="hint">
+    演示夜含 <code>23:59:00 +120s</code>（换表前在当天 61 秒、删除 2016 闰秒后 60 秒）、<code>23:59:59 +2s</code>
+    （换表前占闰秒共 2 秒、换表后 1 秒）、正午 UTC 文本行与一条实秒行；导入后到“取数”查看 2016-12-31，再到“闰秒表”删除该闰秒日并对比同一天。
+  </p>
 
   {% if message %}<p class="error">{{ message }}</p>{% endif %}
   {% if errors %}
@@ -41,4 +49,30 @@
     <div><dt>生效闰秒表</dt><dd>v{{ leap_version }}</dd></div>
   </dl>
 </section>
+
+<script>
+(function () {
+  var header = "telescope,exposure_id,start,duration_s\n";
+  var demo = header +
+    "T1,DEMO-CROSS,2016-12-31 23:59:00,120\n" +
+    "T2,DEMO-LAST,2016-12-31 23:59:59,2\n" +
+    "T3,DEMO-NOON-UTC,2016-12-31 12:00:00,60\n" +
+    "T4,DEMO-NOON-REAL,536500804,5\n";
+  var leap60 = "T5,DEMO-C60-2015,2015-06-30 23:59:60,1\n";
+  var area = document.getElementById("csv_text");
+  document.getElementById("fill-demo").addEventListener("click", function () {
+    area.value = demo;
+    area.focus();
+  });
+  document.getElementById("fill-leap60").addEventListener("click", function () {
+    if (area.value.indexOf("exposure_id") === -1) {
+      area.value = header + leap60;
+    } else {
+      if (area.value.length && area.value.slice(-1) !== "\n") area.value += "\n";
+      area.value += leap60;
+    }
+    area.focus();
+  });
+})();
+</script>
 {% endblock %}

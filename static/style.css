@@ -175,6 +175,19 @@ pre.table-text {
   overflow: auto;
 }
 
+.src-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.src-tag.src-utc { color: #cfe0ff; background: #24324a; border-color: #2f4a7a; }
+.src-tag.src-real { color: #b9f0d8; background: #16352a; border-color: #24583f; }
+
 footer {
   display: flex;
   justify-content: center;
